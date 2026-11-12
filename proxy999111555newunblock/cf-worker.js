@@ -1,12 +1,12 @@
 /* =============================================================================
-   cf-worker.js  ::  vela tunnel worker
+   cf-worker.js  ::  vela tunnel worker  (r14)
    -----------------------------------------------------------------------------
    deploy: dash.cloudflare.com -> Workers & Pages -> Create Worker -> paste -> Deploy
 
    then paste https://<you>.workers.dev into the app's wisp box.
 
-     wss://<you>.workers.dev/wisp/       raw TCP      (scramjet / libcurl)
-     wss://<you>.workers.dev/wisp-tls/   server-side TLS, plain HTTP inside
+     wss://<you>.workers.dev/wisp/         raw TCP
+     wss://<you>.workers.dev/wisp-tls/     server-side TLS, plain HTTP inside
      https://<you>.workers.dev/relay?url=  DNS resolved in Cloudflare, never at school
      https://<you>.workers.dev/doh?name=   DoH passthrough
 
@@ -17,11 +17,12 @@ import { connect } from "cloudflare:sockets";
 
 const PKT = { CONNECT: 1, DATA: 2, CONTINUE: 3, CLOSE: 4, INFO: 5 };
 const BUF = 64;
+const MAX_STREAMS = 48;
 
 const STRIP = [
   "content-security-policy", "content-security-policy-report-only", "x-frame-options",
   "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy",
-  "permissions-policy", "strict-transport-security", "report-to", "nel", "alt-svc", "set-cookie",
+  "permissions-policy", "strict-transport-security", "report-to", "nel", "alt-svc",
   "content-encoding", "content-length"
 ];
 
@@ -35,7 +36,6 @@ const CORS = {
 
 /* ---------------------------------------------------------------- wisp ---- */
 function u32(v) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, true); return b; }
-function u16(v) { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v, true); return b; }
 
 function frame(type, sid, payload) {
   const head = new Uint8Array(5);
@@ -82,7 +82,8 @@ function wispUpgrade(request, doTls) {
 
     if (type === PKT.CONNECT) {
       if (payload.length < 4) return send(PKT.CLOSE, sid, new Uint8Array([0x41]));
-      const streamType = payload[0];
+      if (streams.size >= MAX_STREAMS) return send(PKT.CLOSE, sid, new Uint8Array([0x42]));
+
       const port = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint16(1, true);
       const hostname = new TextDecoder().decode(payload.subarray(3));
       if (!hostname || !port) return send(PKT.CLOSE, sid, new Uint8Array([0x41]));
@@ -127,10 +128,6 @@ function wispUpgrade(request, doTls) {
     }
 
     if (type === PKT.CLOSE) { killStream(sid, 0); return; }
-    if (type === PKT.CONTINUE) {
-      /* client telling us it has room - nothing to do, we are unpaced */
-      return;
-    }
   }
 
   server.addEventListener("message", function (ev) { onMessage(ev); });
@@ -164,9 +161,58 @@ function cleanHeaders(src, extra) {
   return h;
 }
 
+function px(u, base, origin) {
+  try {
+    const abs = new URL(u, base).href;
+    if (!/^https?:/i.test(abs)) return u;
+    return origin + "/relay?url=" + encodeURIComponent(abs);
+  } catch (e) { return u; }
+}
+
+function rewriteHtml(html, base, origin) {
+  html = html.replace(/\s(href|src|action|formaction|poster|data-src)\s*=\s*(["'])([^"']*)\2/gi,
+    function (m, a, q, v) {
+      if (/^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(v)) return m;
+      return " " + a + "=" + q + px(v, base, origin) + q;
+    });
+  html = html.replace(/\ssrcset\s*=\s*(["'])([^"']*)\1/gi, function (m, q, v) {
+    return " srcset=" + q + v.split(",").map(function (p) {
+      const bits = p.trim().split(/\s+/);
+      bits[0] = px(bits[0], base, origin);
+      return bits.join(" ");
+    }).join(", ") + q;
+  });
+  html = html.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (m, q, v) {
+    if (/^(data:|blob:|#)/i.test(v)) return m;
+    return "url(" + q + px(v, base, origin) + q + ")";
+  });
+  return html;
+}
+
+function shim(origin) {
+  const P = origin + "/relay?url=";
+  return "<script>(function(){" +
+    "var P=" + JSON.stringify(P) + ";" +
+    "function px(u){try{var a=new URL(u,document.baseURI).href;return /^https?:/i.test(a)?P+encodeURIComponent(a):u}catch(e){return u}}" +
+    "document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;" +
+    "var h=a.getAttribute('href');if(!h||/^(#|javascript:|mailto:|tel:)/i.test(h))return;e.preventDefault();location.href=px(h)},true);" +
+    "var of=window.fetch;window.fetch=function(i,o){if(typeof i==='string')i=px(i);return of.call(window,i,o)};" +
+    "var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return oo.apply(this,[m,px(u)].concat([].slice.call(arguments,2)))};" +
+    "var ps=history.pushState;history.pushState=function(s,t,u){return u?ps.call(history,s,t,px(u)):ps.apply(history,arguments)};" +
+    "})();</script>";
+}
+
+function sanitizeCookie(v) {
+  return v.split(";").map(function (p) { return p.trim(); })
+    .filter(function (p) {
+      const k = p.split("=")[0].toLowerCase();
+      return k !== "domain" && k !== "secure" && k !== "samesite" && k !== "partitioned";
+    }).join("; ");
+}
+
 function rewriteCss(css, base, origin) {
-  return css.replace(/url\(\s*['"]?([^'")]+)['"]?\s*\)/gi, function (m, u) {
-    if (/^(data:|blob:|#|https?:\/\/)/i.test(u)) return m;
+  return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (m, q, u) {
+    if (/^(data:|blob:|#)/i.test(u)) return m;
     try { return 'url("' + origin + "/relay?url=" + encodeURIComponent(new URL(u, base).href) + '")'; }
     catch (e) { return m; }
   });
@@ -187,23 +233,43 @@ async function relay(request, url) {
   fh.set("accept-language", request.headers.get("accept-language") || "en-US,en;q=0.9");
   const range = request.headers.get("range");
   if (range) fh.set("range", range);
+  const cookie = request.headers.get("cookie");
+  if (cookie) fh.set("cookie", cookie);
 
-  const opts = { method: request.method, headers: fh, redirect: "follow" };
-  const cf = { cacheTtl: 30, cacheEverything: true, scrapeShield: false };
-  const ip = url.searchParams.get("ip");
-  if (ip) cf.resolveOverride = ip;
-  opts.cf = cf;
+  const opts = { method: request.method, headers: fh, redirect: "manual" };
+  if (!cookie) {
+    opts.cf = { cacheTtl: 20, cacheEverything: true, scrapeShield: false };
+    const ip = url.searchParams.get("ip");
+    if (ip) opts.cf.resolveOverride = ip;
+  } else {
+    opts.cf = { scrapeShield: false };
+  }
 
   let up;
   try { up = await fetch(t, opts); }
   catch (e) { return new Response("upstream: " + e.message, { status: 502, headers: CORS }); }
 
   const h = cleanHeaders(up.headers, CORS);
+
+  let sc = [];
+  try { sc = up.headers.getSetCookie ? up.headers.getSetCookie() : []; } catch (e) { sc = []; }
+  if (!sc.length) {
+    const raw = up.headers.get("set-cookie");
+    if (raw) sc = [raw];
+  }
+  sc.forEach(function (c) { try { h.append("set-cookie", sanitizeCookie(c)); } catch (e) {} });
+
+  if (up.status >= 300 && up.status < 400) {
+    const loc = up.headers.get("location");
+    if (loc) h.set("location", px(loc, t, url.origin));
+    return new Response(null, { status: up.status, headers: h });
+  }
+
   const type = (h.get("content-type") || "").toLowerCase();
 
   if (type.indexOf("text/html") !== -1 || type.indexOf("application/xhtml") !== -1) {
-    let body = await up.text();
-    const inject = '<base href="' + t + '" target="_self">';
+    let body = rewriteHtml(await up.text(), t, url.origin);
+    const inject = '<base href="' + t + '">' + shim(url.origin);
     if (/<head[^>]*>/i.test(body)) body = body.replace(/<head([^>]*)>/i, "<head$1>" + inject);
     else body = inject + body;
     h.set("content-type", "text/html; charset=utf-8");
@@ -233,10 +299,10 @@ export default {
 
     if (p === "/doh") {
       const name = url.searchParams.get("name");
-      const type = url.searchParams.get("type") || "A";
+      const rtype = url.searchParams.get("type") || "A";
       if (!name) return new Response("{}", { headers: Object.assign({ "content-type": "application/json" }, CORS) });
       const r = await fetch(
-        "https://cloudflare-dns.com/dns-query?name=" + encodeURIComponent(name) + "&type=" + encodeURIComponent(type),
+        "https://cloudflare-dns.com/dns-query?name=" + encodeURIComponent(name) + "&type=" + encodeURIComponent(rtype),
         { headers: { accept: "application/dns-json" } }
       );
       return new Response(await r.text(), {

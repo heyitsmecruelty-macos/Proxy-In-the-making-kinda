@@ -31,7 +31,7 @@ const CFG = {
   prefix: "p",
   frameName: "f",
   t: {
-    fetch: 14000, probe: 6500, race: 8500, sub: 9000, hedge: 2200,
+    fetch: 22000, probe: 6500, race: 8500, sub: 16000, hedge: 2200,
     wispOpen: 8000, wispIdle: 45000, swBoot: 15000, mount: 6000, ping: 5000
   },
   raceWidth: 3, hedgeWidth: 2, retries: 2, retryBase: 240,
@@ -39,7 +39,7 @@ const CFG = {
   cacheTTL: 5 * 60 * 1000, cacheMax: 150, maxHistory: 900,
   subConcurrency: 8, maxRedirects: 6,
   /* worker subrequest budget: free plan is 50, paid is 1000 */
-  wispBudget: 34,
+  wispBudget: 12,
   lsPrefix: "vela13:", idb: "vela13-db", idbVer: 1,
   sj: { sj: "1.1.0", mux: "2.1.9", tr: "1.5.2" },
   cdn: ["https://cdn.jsdelivr.net/npm/", "https://unpkg.com/", "https://esm.sh/"],
@@ -1058,137 +1058,16 @@ const Wisp = (function () {
   };
 
   function Stream(client, id, host, port) {
-    this.client = client;
-    this.id = id;
-    this.host = host;
-    this.port = port;
-    this.closed = false;
-    this.onData = null;
-    this.onClose = null;
-    this.credit = 0;
-    this.queue = [];
-  }
-  Stream.prototype._continue = function () {
-    this.credit = this.client.bufSize;
-    while (this.queue.length && this.credit > 0) {
-      this.client._send(PKT.DATA, this.id, this.queue.shift());
-      this.credit--;
-    }
-  };
-  Stream.prototype._data = function (payload) {
-    this.client.lastUse = Date.now();
-    if (this.onData) this.onData(payload);
-  };
-  Stream.prototype._die = function (why) {
-    if (this.closed) return;
-    this.closed = true;
-    this.client.streams.delete(this.id);
-    if (this.onClose) this.onClose(why || "closed");
-  };
-  Stream.prototype.write = function (data) {
-    if (this.closed) return false;
-    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data));
-    if (this.credit > 0) { this.client._send(PKT.DATA, this.id, bytes); this.credit--; }
-    else this.queue.push(bytes);
-    return true;
-  };
-  Stream.prototype.close = function (reason) {
-    if (this.closed) return;
-    this.client._send(PKT.CLOSE, this.id, new Uint8Array([reason || CLOSE.VOLUNTARY]));
-    this._die("closed");
-  };
-
-  function get(url) {
-    if (clients.has(url)) return clients.get(url);
-    const c = new Client(url);
-    clients.set(url, c);
-    return c;
-  }
-
-  function openOn(url, host, port, streamType) {
-    const c = get(url);
-    return c.connect().then(function () {
-      c.count++;
-      const id = c.nextId++;
-      if (c.nextId > 0xfffffffe) c.nextId = 1;
-      const st = new Stream(c, id, host, port);
-      c.streams.set(id, st);
-      const hostBytes = new TextEncoder().encode(host);
-      const payload = new Uint8Array(3 + hostBytes.length);
-      payload[0] = streamType || 1;
-      new DataView(payload.buffer).setUint16(1, port, true);
-      payload.set(hostBytes, 3);
-      c._send(PKT.CONNECT, id, payload);
-      setTimeout(function () { if (st.credit === 0) st.credit = c.bufSize || 32; }, 60);
-      return st;
-    });
-  }
-
-  /* race the same stream across two endpoints; first byte wins */
-  function openStream(url, host, port, streamType) {
-    if (!UI.S.raceStreams) return openOn(url, host, port, streamType);
-    const fleet = Fleet.ranked();
-    const alt = fleet.length > 1 ? Fleet.urlFor(fleet[1], "/wisp-tls/") : null;
-    if (!alt || alt === url) return openOn(url, host, port, streamType);
-
-    return new Promise(function (resolve, reject) {
-      let done = false;
-      const losers = [];
-      const t0 = nowMs();
-      function attempt(u) {
-        return openOn(u, host, port, streamType).then(function (st) {
-          if (done) { losers.push(st); return; }
-          st.onData = function (payload) {
-            if (done) return;
-            done = true;
-            Bus.emit("wisp:race", { winner: u, ms: Math.round(nowMs() - t0) });
-            losers.forEach(function (l) { try { l.close(); } catch (e) {} });
-            if (st.__wrapped) { st.onData(payload); return; }
-            st.__first = payload;
-            resolve(st);
-          };
-          st.onClose = function (why) {
-            if (done) return;
-            done = true;
-            reject(new Error("race closed: " + why));
-          };
-          setTimeout(function () {
-            if (!done) { done = true; try { st.close(); } catch (e) {} reject(new Error("race timeout")); }
-          }, CFG.t.wispOpen + 2000);
-          return st;
-        }).catch(function (e) {
-          if (!done) { done = true; reject(e); }
-        });
-      }
-      attempt(url);
-      attempt(alt);
-    });
-  }
-
-  function closeAll() {
-    clients.forEach(function (c) { try { if (c.ws) c.ws.close(); } catch (e) {} });
-    clients.clear();
-  }
-  function prune() {
-    const now = Date.now();
-    clients.forEach(function (c, url) {
-      if (c.streams.size === 0 && now - c.lastUse > CFG.t.wispIdle) {
-        try { if (c.ws) c.ws.close(); } catch (e) {}
-        clients.delete(url);
-      }
-    });
-  }
-  setInterval(prune, 20000);
-
-  function stats() {
-    const out = [];
-    clients.forEach(function (c, url) {
-      out.push({ url: url, open: c.open, streams: c.streams.size, bytes: c.bytes, gen: c.generation, count: c.count });
-    });
-    return out;
-  }
-
-  return { openStream: openStream, openOn: openOn, closeAll: closeAll, stats: stats, CLOSE: CLOSE };
+  this.client = client;
+  this.id = id;
+  this.host = host;
+  this.port = port;
+  this.closed = false;
+  this._onData = null;
+  this.pre = [];
+  this.onClose = null;
+  this.credit = 0;
+  this.queue = [];
 })();
 
 /* =============================================================================
@@ -1315,7 +1194,7 @@ const WispHTTP = (function () {
           "User-Agent: Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           "Accept: " + (opts.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
           "Accept-Language: en-US,en;q=0.9",
-          "Accept-Encoding: gzip, deflate, br",
+          "Accept-Encoding: gzip, deflate",
           "Connection: close"
         ];
         if (opts.headers) Object.keys(opts.headers).forEach(function (k) { head.push(k + ": " + opts.headers[k]); });
@@ -1726,7 +1605,7 @@ const SJ = (function () {
       "});",
       "self.addEventListener('fetch', function (e) {",
       "  const u = e.request.url;",
-      "  if (u.indexOf(P) !== -1) {",
+      "  if (u.indexOf(location.origin + P) === 0) {",
       "    e.respondWith((async function () {",
       "      try { if (!sj) throw 0; await sj.loadConfig(); if (sj.route(e)) return await sj.fetch(e); } catch (x) {}",
       "      return fetch(e.request);",
@@ -1870,6 +1749,12 @@ const SJ = (function () {
 const WTrans = (function () {
   const enc = new TextEncoder();
 
+  function concat(a, b) {
+    var m = new Uint8Array(a.length + b.length);
+    m.set(a, 0); m.set(b, a.length);
+    return m;
+  }
+
   function BareWebSocket(stream) {
     this.binaryType = "arraybuffer";
     this.readyState = 1;
@@ -1887,13 +1772,16 @@ const WTrans = (function () {
       self.readyState = 3;
       if (self.onclose) { try { self.onclose({ code: 1006, reason: why }); } catch (e) {} }
     };
-    if (this.onopen) setTimeout(function () { self.onopen({}); }, 0);
   }
+
   BareWebSocket.prototype.send = function (data) {
     if (this._st.closed) return;
-    if (typeof data === "string") this._st.write(enc.encode(data));
-    else if (data instanceof ArrayBuffer) this._st.write(new Uint8Array(data));
-    else if (data && data.buffer) this._st.write(new Uint8Array(data.buffer));
+    var bytes;
+    if (typeof data === "string") bytes = enc.encode(data);
+    else if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if (data && data.buffer) bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+    else return;
+    this._st.write(frame(1, bytes));
   };
   BareWebSocket.prototype.close = function () { this._st.close(); };
   BareWebSocket.prototype.addEventListener = function (k, fn) { this["on" + k] = fn; };
@@ -2004,59 +1892,69 @@ const WTrans = (function () {
       st.write(enc.encode(lines.join("\r\n")));
 
       const ws = new BareWebSocket(st);
-      let buffered = new Uint8Array(0);
+      let hsBuf = new Uint8Array(0);
+      let partial = new Uint8Array(0);
       let handshook = false;
       let frag = [];
 
-      st.onData = function (payload) {
-        if (!handshook) {
-          const merged = new Uint8Array(buffered.length + payload.length);
-          merged.set(buffered, 0);
-          merged.set(payload, buffered.length);
-          buffered = merged;
-          const end = headEnd(buffered);
-          if (end === -1) return;
-          handshook = true;
-          buffered = buffered.subarray(end);
-          if (ws.onopen) { try { ws.onopen({}); } catch (e) {} }
-        }
-        let buf = buffered.length ? (function () {
-          const m = new Uint8Array(buffered.length + payload.length);
-          m.set(buffered, 0);
-          m.set(payload, buffered.length);
-          return m;
-        })() : payload;
-        buffered = new Uint8Array(0);
-
+      function parse(chunk) {
+        let buf = partial.length ? concat(partial, chunk) : chunk;
+        partial = new Uint8Array(0);
         let i = 0;
         while (i + 2 <= buf.length) {
           const b1 = buf[i + 1];
           const masked = (b1 & 0x80) !== 0;
           let len = b1 & 0x7f;
           let off = 2;
-          if (len === 126) { if (i + 4 > buf.length) { buffered = buf.subarray(i); return; } len = (buf[i + 2] << 8) | buf[i + 3]; off = 4; }
-          else if (len === 127) { if (i + 10 > buf.length) { buffered = buf.subarray(i); return; } len = 0; for (let k = 0; k < 8; k++) len = len * 256 + buf[i + 2 + k]; off = 10; }
+          if (len === 126) {
+            if (i + 4 > buf.length) { partial = buf.subarray(i); return; }
+            len = (buf[i + 2] << 8) | buf[i + 3]; off = 4;
+          } else if (len === 127) {
+            if (i + 10 > buf.length) { partial = buf.subarray(i); return; }
+            len = 0;
+            for (let k = 0; k < 8; k++) len = len * 256 + buf[i + 2 + k];
+            off = 10;
+          }
           if (masked) off += 4;
-          if (i + off + len > buf.length) { buffered = buf.subarray(i); return; }
+          if (i + off + len > buf.length) { partial = buf.subarray(i); return; }
           const op = buf[i] & 0x0f;
           const data = buf.subarray(i + off, i + off + len);
           i += off + len;
-          if (op === 8) { st.close(); if (ws.onclose) ws.onclose({ code: 1000 }); return; }
-          if (op === 9) continue;
+          if (op === 8) {
+            try { st.write(frame(8, data)); } catch (e) {}
+            st.close();
+            if (ws.onclose) { try { ws.onclose({ code: 1000 }); } catch (e) {} }
+            return;
+          }
+          if (op === 9) { try { st.write(frame(10, data)); } catch (e) {} continue; }
+          if (op === 10) continue;
           if (op === 1 || op === 2) {
             frag.push(data);
             if (ws.onmessage) {
-              let total = 0;
-              frag.forEach(function (f) { total += f.length; });
-              const merged2 = new Uint8Array(total);
-              let o2 = 0;
-              frag.forEach(function (f) { merged2.set(f, o2); o2 += f.length; });
+              let all = frag[0];
+              for (let f = 1; f < frag.length; f++) all = concat(all, frag[f]);
               frag = [];
-              try { ws.onmessage({ data: merged2.buffer }); } catch (e) {}
+              try { ws.onmessage({ data: all.buffer }); } catch (e) {}
             }
           }
         }
+      }
+
+      st.onData = function (payload) {
+        if (!handshook) {
+          hsBuf = concat(hsBuf, payload);
+          const end = headEnd(hsBuf);
+          if (end === -1) return;
+          handshook = true;
+          const rest = hsBuf.subarray(end);
+          hsBuf = new Uint8Array(0);
+          if (ws.onopen) { try { ws.onopen({}); } catch (e) {} }
+          if (rest.length) parse(rest);
+          return;
+        }
+        parse(payload);
       };
+
       st.onClose = function (why) { if (ws.onclose) ws.onclose({ code: 1006, reason: why }); };
       return ws;
     });
@@ -2082,7 +1980,7 @@ const WTrans = (function () {
     init: function () { this.ready = true; return Promise.resolve(); },
     request: request, connect: connect, connectws: connect, frame: frame
   };
-})();
+});
 
 /* =============================================================================
    22  shim / shield / user scripts
@@ -5209,6 +5107,7 @@ const Boot = (function () {
   }, 800);
 
   function run() {
+    let restoredSession = null;
     const bl = bootLog();
     envLine();
 
@@ -5239,9 +5138,11 @@ const Boot = (function () {
         Pool.setCustoms($("proxyInput") ? $("proxyInput").value : "");
         UI.applyState();
         if (UI.S.hard) $("btnLS").classList.add("on");
+        restoredSession = session;
         return Pool.init();
       })
-      .then(function (session) {
+      .then(function () {
+        let session = restoredSession;
         dots();
         Radar.draw();
         UI.fleetStat();

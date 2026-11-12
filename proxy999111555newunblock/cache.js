@@ -1,5 +1,5 @@
 /* =============================================================================
-   cache.js  ::  vela service worker
+   cache.js  ::  vela service worker  (r14)
    -----------------------------------------------------------------------------
    Deliberately not called sw.js - Lightspeed's Live Intelligence greps the
    registration path for /(sw|service[-_]?worker|uv|scramjet|bare)/.
@@ -93,9 +93,11 @@ async function relayPassthrough(request) {
 self.addEventListener("fetch", function (e) {
   const req = e.request;
   const url = req.url;
+  const origin = self.location.origin;
 
-  /* 1. scramjet traffic */
-  if (url.indexOf(PREFIX) !== -1 || url.indexOf(location.origin + PREFIX) === 0) {
+  /* 1. scramjet traffic - anchored to our own origin so a stray "/p/" in a
+        path can never hijack an unrelated request */
+  if (url.indexOf(origin + PREFIX) === 0) {
     e.respondWith((async function () {
       try {
         if (!sj) throw new Error("no scramjet");
