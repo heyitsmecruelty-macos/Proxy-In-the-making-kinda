@@ -975,7 +975,16 @@ background:var(--bg2);color:var(--fg2);transition:border-color var(--tf),color v
   }, 3000);
 })();
 </script>
-<script src="vela.js" defer></script>
+<script>
+fetch("vela.js").then(function (r) { return r.text(); }).then(function (t) {
+  var s = document.createElement("script");
+  s.textContent = t;
+  document.head.appendChild(s);
+}).catch(function () {
+  var l = document.getElementById("bootLog");
+  if (l) l.textContent = "vela.js fetch failed";
+});
+</script>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   function pick(id, val) {

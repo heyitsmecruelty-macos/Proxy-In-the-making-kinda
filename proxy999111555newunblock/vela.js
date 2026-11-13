@@ -1068,6 +1068,141 @@ const Wisp = (function () {
   this.onClose = null;
   this.credit = 0;
   this.queue = [];
+}
+  Stream.prototype._continue = function () {
+    this.credit = this.client.bufSize;
+    while (this.queue.length && this.credit > 0) {
+      this.client._send(PKT.DATA, this.id, this.queue.shift());
+      this.credit--;
+    }
+  };
+  Object.defineProperty(Stream.prototype, "onData", {
+  configurable: true,
+  get: function () { return this._onData; },
+  set: function (fn) {
+    this._onData = fn;
+    if (fn && this.pre.length) {
+      var q = this.pre;
+      this.pre = [];
+      for (var i = 0; i < q.length; i++) { try { fn(q[i]); } catch (e) {} }
+    }
+  }
+});
+Stream.prototype._data = function (payload) {
+  this.client.lastUse = Date.now();
+  if (this._onData) this._onData(payload);
+  else if (this.pre.length < 64) this.pre.push(payload);
+};;
+  Stream.prototype._die = function (why) {
+    if (this.closed) return;
+    this.closed = true;
+    this.client.streams.delete(this.id);
+    if (this.onClose) this.onClose(why || "closed");
+  };
+  Stream.prototype.write = function (data) {
+    if (this.closed) return false;
+    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data));
+    if (this.credit > 0) { this.client._send(PKT.DATA, this.id, bytes); this.credit--; }
+    else this.queue.push(bytes);
+    return true;
+  };
+  Stream.prototype.close = function (reason) {
+    if (this.closed) return;
+    this.client._send(PKT.CLOSE, this.id, new Uint8Array([reason || CLOSE.VOLUNTARY]));
+    this._die("closed");
+  };
+
+  function get(url) {
+    if (clients.has(url)) return clients.get(url);
+    const c = new Client(url);
+    clients.set(url, c);
+    return c;
+  }
+
+  function openOn(url, host, port, streamType) {
+    const c = get(url);
+    return c.connect().then(function () {
+      c.count++;
+      const id = c.nextId++;
+      if (c.nextId > 0xfffffffe) c.nextId = 1;
+      const st = new Stream(c, id, host, port);
+      c.streams.set(id, st);
+      const hostBytes = new TextEncoder().encode(host);
+      const payload = new Uint8Array(3 + hostBytes.length);
+      payload[0] = streamType || 1;
+      new DataView(payload.buffer).setUint16(1, port, true);
+      payload.set(hostBytes, 3);
+      c._send(PKT.CONNECT, id, payload);
+      setTimeout(function () { if (st.credit === 0) st.credit = c.bufSize || 32; }, 60);
+      return st;
+    });
+  }
+
+  /* race the same stream across two endpoints; first byte wins */
+  function openStream(url, host, port, streamType) {
+    if (!UI.S.raceStreams) return openOn(url, host, port, streamType);
+    const fleet = Fleet.ranked();
+    const alt = fleet.length > 1 ? Fleet.urlFor(fleet[1], "/wisp-tls/") : null;
+    if (!alt || alt === url) return openOn(url, host, port, streamType);
+
+    return new Promise(function (resolve, reject) {
+      let done = false;
+      const losers = [];
+      const t0 = nowMs();
+      function attempt(u) {
+        return openOn(u, host, port, streamType).then(function (st) {
+          if (done) { losers.push(st); return; }
+          st.onData = function (payload) {
+            if (done) return;
+            done = true;
+            Bus.emit("wisp:race", { winner: u, ms: Math.round(nowMs() - t0) });
+            losers.forEach(function (l) { try { l.close(); } catch (e) {} });
+st._onData = null;
+            st.pre.unshift(payload);
+            resolve(st);
+          };
+          st.onClose = function (why) {
+            if (done) return;
+            done = true;
+            reject(new Error("race closed: " + why));
+          };
+          setTimeout(function () {
+            if (!done) { done = true; try { st.close(); } catch (e) {} reject(new Error("race timeout")); }
+          }, CFG.t.wispOpen + 2000);
+          return st;
+        }).catch(function (e) {
+          if (!done) { done = true; reject(e); }
+        });
+      }
+      attempt(url);
+      attempt(alt);
+    });
+  }
+
+  function closeAll() {
+    clients.forEach(function (c) { try { if (c.ws) c.ws.close(); } catch (e) {} });
+    clients.clear();
+  }
+  function prune() {
+    const now = Date.now();
+    clients.forEach(function (c, url) {
+      if (c.streams.size === 0 && now - c.lastUse > CFG.t.wispIdle) {
+        try { if (c.ws) c.ws.close(); } catch (e) {}
+        clients.delete(url);
+      }
+    });
+  }
+  setInterval(prune, 20000);
+
+  function stats() {
+    const out = [];
+    clients.forEach(function (c, url) {
+      out.push({ url: url, open: c.open, streams: c.streams.size, bytes: c.bytes, gen: c.generation, count: c.count });
+    });
+    return out;
+  }
+
+  return { openStream: openStream, openOn: openOn, closeAll: closeAll, stats: stats, CLOSE: CLOSE };
 })();
 
 /* =============================================================================
@@ -1980,7 +2115,7 @@ const WTrans = (function () {
     init: function () { this.ready = true; return Promise.resolve(); },
     request: request, connect: connect, connectws: connect, frame: frame
   };
-});
+})();
 
 /* =============================================================================
    22  shim / shield / user scripts
